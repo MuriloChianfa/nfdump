@@ -91,7 +91,7 @@ static uint32_t sequence = 0;
 /* Function Prototypes */
 static void usage(char *name);
 
-static void send_data(void *engine, timeWindow_t *timeWindow, uint64_t count, unsigned int delay, int confirm, int netflow_version, int distribution);
+static void send_data(void *engine, timeWindow_t *timeWindow, uint64_t count, unsigned int delay, int confirm, int netflow_version, int distribution, int arrival_mode);
 
 static int FlushBuffer(int confirm);
 
@@ -114,6 +114,7 @@ static void usage(char *name) {
         "-j <mcast>\tSend packets to multicast group\n"
         "-4\t\tForce IPv4 protocol.\n"
         "-6\t\tForce IPv6 protocol.\n"
+        "-a\t\tReplay flows based on arrival time with real-time distribution\n"
         "-L <log>\tLog to syslog facility <log>\n"
         "-p <port>\tTarget port default 9995\n"
         "-S <ip>\tSource IP address for sending flows\n"
@@ -222,7 +223,7 @@ static void FreeRecordHandle(recordHandle_t *handle) {
 }  // End of FreeRecordHandle
 
 static void send_data(void *engine, timeWindow_t *timeWindow, uint64_t limitRecords, unsigned int delay, int confirm, int netflow_version,
-                      int distribution) {
+                      int distribution, int arrival_mode) {
     nffile_t *nffile;
     uint64_t twin_msecFirst, twin_msecLast;
 
@@ -230,6 +231,10 @@ static void send_data(void *engine, timeWindow_t *timeWindow, uint64_t limitReco
     struct timeval todayTime, currentTime;
     double today = 0, reftime = 0;
     int reducer = 0;
+
+    // a-parameter variables (arrival time mode)
+    double arrival_reftime = 0;
+    double arrival_today = 0;
 
     if (timeWindow) {
         twin_msecFirst = timeWindow->msecFirst;
@@ -340,6 +345,46 @@ static void send_data(void *engine, timeWindow_t *timeWindow, uint64_t limitReco
                         goto NEXT;
                     }
                     // Records passed filter -> continue record processing
+
+                    // Apply arrival time mode BEFORE adding to buffer
+                    if (arrival_mode) {
+                        EXgenericFlow_t *genericFlow = (EXgenericFlow_t *)recordHandle->extensionList[EXgenericFlowID];
+                        if (genericFlow && genericFlow->msecReceived > 1000000000000) {
+                            // Initialize arrival reference time on first valid msecReceived
+                            if (arrival_reftime == 0) {
+                                arrival_reftime = (double)genericFlow->msecReceived / 1000.0;
+                                gettimeofday(&todayTime, NULL);
+                                arrival_today = (double)todayTime.tv_sec + (double)todayTime.tv_usec / 1000000;
+                                if (verbose) {
+                                    printf("DEBUG: Initialize arrival timing - reftime=%.3f, today=%.3f\n",
+                                           arrival_reftime, arrival_today);
+                                }
+                            } else {
+                                double arrival_time = (double)genericFlow->msecReceived / 1000.0;
+                                double flow_elapsed = arrival_time - arrival_reftime;
+
+                                // Only wait for future flows
+                                if (flow_elapsed > 0) {
+                                    gettimeofday(&currentTime, NULL);
+                                    double now = (double)currentTime.tv_sec + (double)currentTime.tv_usec / 1000000;
+                                    double real_elapsed = now - arrival_today;
+
+                                    if (verbose) {
+                                        printf("DEBUG: arrival_time=%.3f, flow_elapsed=%.3f, real_elapsed=%.3f\n",
+                                               arrival_time, flow_elapsed, real_elapsed);
+                                    }
+
+                                    // Wait until real time matches flow arrival time
+                                    while (flow_elapsed > real_elapsed) {
+                                        usleep(1000);
+                                        gettimeofday(&currentTime, NULL);
+                                        now = (double)currentTime.tv_sec + (double)currentTime.tv_usec / 1000000;
+                                        real_elapsed = now - arrival_today;
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     int again = 0;
                     switch (netflow_version) {
@@ -482,8 +527,9 @@ int main(int argc, char **argv) {
     uint64_t count = 0;
     int confirm = 0;
     int distribution = 0;
+    int arrival_mode = 0;
     int c = 0;
-    while ((c = getopt(argc, argv, "46EhH:i:L:p:S:d:c:b:j:r:f:t:v:z:VY")) != EOF) {
+    while ((c = getopt(argc, argv, "46aEhH:i:L:p:S:d:c:b:j:r:f:t:v:z:VY")) != EOF) {
         switch (c) {
             case 'h':
                 usage(argv[0]);
@@ -585,6 +631,9 @@ int main(int argc, char **argv) {
                     exit(EXIT_FAILURE);
                 }
                 break;
+            case 'a':
+                arrival_mode = 1;
+                break;
             default:
                 usage(argv[0]);
                 exit(0);
@@ -630,7 +679,7 @@ int main(int argc, char **argv) {
     queue_t *fileList = SetupInputFileSequence(&flist);
     if (!Init_nffile(1, fileList)) exit(254);
 
-    send_data(engine, timeWindow, count, delay, confirm, netflow_version, distribution);
+    send_data(engine, timeWindow, count, delay, confirm, netflow_version, distribution, arrival_mode);
 
     return 0;
 }

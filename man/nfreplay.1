@@ -40,6 +40,7 @@
 .Op Fl j Ar mcastgroup
 .Op Fl 4
 .Op Fl 6
+.Op Fl a
 .Op Fl v Ar version
 .Op Fl d Ar usec
 .Op Fl b Ar buffsize
@@ -85,6 +86,11 @@ Forces
 .Nm
 to send flows to a IPv6 address only. Can be used if the remote host has
 an IPv4 and IPv6 address record.
+.It Fl a
+Replay flows based on their arrival time at the collector with real-time distribution.
+The arrival time uses the msecReceived timestamp. Flows are replayed with the exact same
+timing as they arrived at the collector. For example, if 5 minutes of flows were captured,
+they will be replayed over 5 minutes.
 .It Fl v Ar version
 Send flows as netflow version
 .Ar version . 
