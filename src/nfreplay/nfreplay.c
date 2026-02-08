@@ -91,7 +91,7 @@ static uint32_t sequence = 0;
 /* Function Prototypes */
 static void usage(char *name);
 
-static void send_data(void *engine, timeWindow_t *timeWindow, uint64_t count, unsigned int delay, int confirm, int netflow_version, int distribution, int arrival_mode);
+static void send_data(void *engine, timeWindow_t *timeWindow, uint64_t count, unsigned int delay, int confirm, int netflow_version, int distribution, int arrival_mode, int loop_count);
 
 static int FlushBuffer(int confirm);
 
@@ -115,6 +115,7 @@ static void usage(char *name) {
         "-4\t\tForce IPv4 protocol.\n"
         "-6\t\tForce IPv6 protocol.\n"
         "-a\t\tReplay flows based on arrival time with real-time distribution\n"
+        "-l [count]\tLoop replay. -l = infinite, -l N = loop N times\n"
         "-L <log>\tLog to syslog facility <log>\n"
         "-p <port>\tTarget port default 9995\n"
         "-S <ip>\tSource IP address for sending flows\n"
@@ -223,7 +224,7 @@ static void FreeRecordHandle(recordHandle_t *handle) {
 }  // End of FreeRecordHandle
 
 static void send_data(void *engine, timeWindow_t *timeWindow, uint64_t limitRecords, unsigned int delay, int confirm, int netflow_version,
-                      int distribution, int arrival_mode) {
+                      int distribution, int arrival_mode, int loop_count) {
     nffile_t *nffile;
     uint64_t twin_msecFirst, twin_msecLast;
 
@@ -489,15 +490,13 @@ static void send_data(void *engine, timeWindow_t *timeWindow, uint64_t limitReco
             break;
     }
     int ret = FlushBuffer(confirm);
-    if (ret < 0) {
-        LogError("Error flushing send buffer");
+    if (ret < 0 && verbose) {
+        LogError("Error flushing send buffer: %s", strerror(errno));
     }
 
     if (nffile) {
         DisposeFile(nffile);
     }
-
-    close(peer.sockfd);
 
     return;
 
@@ -528,8 +527,10 @@ int main(int argc, char **argv) {
     int confirm = 0;
     int distribution = 0;
     int arrival_mode = 0;
+    int loop_count = -1;
     int c = 0;
-    while ((c = getopt(argc, argv, "46aEhH:i:L:p:S:d:c:b:j:r:f:t:v:z:VY")) != EOF) {
+    int loop_flag_seen = 0;
+    while ((c = getopt(argc, argv, "46aEhH:i:l::L:p:S:d:c:b:j:r:f:t:v:z:VY")) != EOF) {
         switch (c) {
             case 'h':
                 usage(argv[0]);
@@ -634,11 +635,42 @@ int main(int argc, char **argv) {
             case 'a':
                 arrival_mode = 1;
                 break;
+            case 'l': {
+                loop_flag_seen = 1;
+                if (optarg == NULL || optarg[0] == '\0') {
+                    // -l without immediate argument - check next argv for number
+                    // Default to infinite if no number follows
+                    loop_count = 0;
+                } else {
+                    int l = atoi(optarg);
+                    if (l < 0) {
+                        LogError("Loop count cannot be < 0: %d", l);
+                        exit(EXIT_FAILURE);
+                    }
+                    loop_count = l;
+                }
+            } break;
             default:
                 usage(argv[0]);
                 exit(0);
         }
     }
+
+    // Post-process: if -l was seen without an argument, check if next arg is a number
+    if (loop_flag_seen && loop_count == 0 && optind < argc) {
+        char *potential_num = argv[optind];
+        // Check if it's a number (not a filter or other option)
+        if (potential_num && potential_num[0] >= '0' && potential_num[0] <= '9') {
+            char *endptr;
+            long val = strtol(potential_num, &endptr, 10);
+            // If entire string is a valid number, use it as loop count
+            if (*endptr == '\0' && val >= 0) {
+                loop_count = (int)val;
+                optind++;  // Finally consume this argument
+            }
+        }
+    }
+
     if (argc - optind > 1) {
         usage(argv[0]);
         exit(EXIT_FAILURE);
@@ -679,7 +711,41 @@ int main(int argc, char **argv) {
     queue_t *fileList = SetupInputFileSequence(&flist);
     if (!Init_nffile(1, fileList)) exit(254);
 
-    send_data(engine, timeWindow, count, delay, confirm, netflow_version, distribution, arrival_mode);
+    // No loop: single execution (default behavior)
+    if (loop_count < 0) {
+        send_data(engine, timeWindow, count, delay, confirm, netflow_version, distribution, arrival_mode, loop_count);
+        close(peer.sockfd);
+        return 0;
+    }
+
+    // Loop control: execute replay loop_count times or infinitely if loop_count == 0
+    int current_loop = 0;
+    if (loop_count == 0) {
+        printf("Starting infinite loop replay (use Ctrl+C to stop)\n");
+    }
+
+    while (1) {
+        current_loop++;
+
+        if (loop_count > 0) {
+            if (current_loop > loop_count) {
+                break;
+            }
+            printf("Starting loop iteration %d of %d\n", current_loop, loop_count);
+        } else if (current_loop > 1) {
+            printf("Starting loop iteration %d\n", current_loop);
+        }
+
+        send_data(engine, timeWindow, count, delay, confirm, netflow_version, distribution, arrival_mode, loop_count);
+
+        // Reset file list for next iteration
+        if ((loop_count == 0) || (loop_count > 0 && current_loop < loop_count)) {
+            fileList = SetupInputFileSequence(&flist);
+            if (!Init_nffile(1, fileList)) exit(254);
+        }
+    }
+
+    close(peer.sockfd);
 
     return 0;
 }
